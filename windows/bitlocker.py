@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from typing import Iterator, List, Set, Tuple
+from typing import Iterator, List, Optional, Set, Tuple
 
 from volatility3.framework import constants, exceptions, interfaces, renderers, symbols
 from volatility3.framework.configuration import requirements
@@ -13,14 +13,14 @@ from volatility3.plugins.windows import info, poolscanner, pslist
 
 vollog = logging.getLogger(__name__)
 
-Row = Tuple[str, str, str, str, str, str, str]
+Row = Tuple[str, str, str, str, str]
 
 
 class Bitlocker(interfaces.plugins.PluginInterface):
     """Recovers BitLocker FVEKs, VMKs, and plaintext recovery passwords from memory."""
 
     _required_framework_version = (2, 0, 0)
-    _version = (2, 0, 0)
+    _version = (2, 3, 0)
 
     BLMode = {
         "00": "AES 128-bit with Diffuser",
@@ -81,6 +81,11 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 default=False,
                 optional=True,
             ),
+            requirements.StringRequirement(
+                name="export",
+                description="Optional path or prefix used to export recovered FVEKs as Dislocker-ready key files",
+                optional=True,
+            ),
         ]
 
     @staticmethod
@@ -134,10 +139,8 @@ class Bitlocker(interfaces.plugins.PluginInterface):
         cipher: str,
         key: str,
         direct_use: str,
-        tool: str,
-        context: str,
     ) -> Row:
-        return (location, material_type, cipher, key, direct_use, tool, context)
+        return (location, material_type, cipher, key, direct_use)
 
     def _read_member_bytes(
         self,
@@ -155,7 +158,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
     def _build_fvek_row(
         self,
         location: str,
-        context: str,
         cipher: str,
         fvek: bytes,
         tweak: bytes,
@@ -168,9 +170,102 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             cipher=cipher,
             key=self._format_extracted_key(fvek, tweak),
             direct_use=self._build_dislocker_hex(algorithm, raw_key),
-            tool="dislocker -k (hex->bin)",
-            context=context,
         )
+
+    def _get_export_path(self) -> Optional[str]:
+        export_path = self.config.get("export", None)
+        if not export_path:
+            return None
+
+        candidate = os.path.abspath(os.path.expanduser(export_path.strip().strip('"')))
+        if not candidate:
+            raise ValueError("--export cannot be empty")
+
+        return candidate
+
+    @staticmethod
+    def _sanitize_export_suffix(value: str) -> str:
+        return value.replace(":", "_").replace("\\", "_").replace("/", "_")
+
+    @staticmethod
+    def _is_directory_hint(path: str) -> bool:
+        separators = [os.sep]
+        if os.altsep:
+            separators.append(os.altsep)
+
+        return any(path.endswith(separator) for separator in separators)
+
+    @classmethod
+    def _build_export_target_path(
+        cls, export_path: str, row: Row, multiple: bool
+    ) -> str:
+        if not multiple:
+            return export_path
+
+        suffix = cls._sanitize_export_suffix(row[0])
+        if os.path.isdir(export_path) or cls._is_directory_hint(export_path):
+            base_dir = export_path.rstrip(os.sep)
+            if os.altsep:
+                base_dir = base_dir.rstrip(os.altsep)
+            return os.path.join(base_dir, f"{suffix}.fvek")
+
+        root, ext = os.path.splitext(export_path)
+        if not ext:
+            root = export_path
+            ext = ".fvek"
+
+        return f"{root}-{suffix}{ext}"
+
+    @staticmethod
+    def _write_export_file(path: str, direct_use: str) -> str:
+        parent_dir = os.path.dirname(path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
+
+        with open(path, "wb") as file_handle:
+            file_handle.write(bytes.fromhex(direct_use))
+
+        return path
+
+    def _export_fvek(self, export_path: str, row: Row) -> Row:
+        if row[1] != "FVEK":
+            raise ValueError("Only FVEK rows can be exported")
+
+        written_path = self._write_export_file(export_path, row[4])
+        vollog.info(f"Exported BitLocker key file to: {written_path}")
+
+        return self._build_row(
+            location=row[0],
+            material_type="Export",
+            cipher=row[2],
+            key=row[3],
+            direct_use=written_path,
+        )
+
+    def _export_fveks(self, export_path: str, fvek_rows: List[Row]) -> Iterator[Row]:
+        if not fvek_rows:
+            yield self._build_row(
+                location=export_path,
+                material_type="Export",
+                cipher="Failed",
+                key="",
+                direct_use="No recovered FVEK available for export",
+            )
+            return
+
+        multiple = len(fvek_rows) > 1
+        for row in fvek_rows:
+            target_path = self._build_export_target_path(export_path, row, multiple)
+            try:
+                yield self._export_fvek(target_path, row)
+            except (OSError, ValueError) as excp:
+                yield self._build_row(
+                    location=row[0],
+                    material_type="Export",
+                    cipher="Failed",
+                    key=row[3],
+                    direct_use=str(excp),
+                )
 
     @staticmethod
     def _recovery_block_is_valid(block: str) -> bool:
@@ -215,8 +310,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
         self,
         proc_layer,
         sections,
-        process_name: str,
-        proc_id: int,
         pattern: bytes,
         compiled_pattern: re.Pattern,
         read_size: int,
@@ -252,8 +345,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                     cipher="",
                     key=candidate,
                     direct_use=candidate,
-                    tool="dislocker -p / bdemount -r",
-                    context=f"{encoding} in process {process_name} ({proc_id})",
                 )
         except exceptions.InvalidAddressException:
             return
@@ -295,8 +386,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             yield from self._scan_recovery_pattern(
                 proc_layer=proc_layer,
                 sections=sections,
-                process_name=process_name,
-                proc_id=proc_id,
                 pattern=self._RECOVERY_PASSWORD_ASCII_RE.pattern,
                 compiled_pattern=self._RECOVERY_PASSWORD_ASCII_RE,
                 read_size=self._RECOVERY_PASSWORD_LENGTH,
@@ -305,8 +394,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             yield from self._scan_recovery_pattern(
                 proc_layer=proc_layer,
                 sections=sections,
-                process_name=process_name,
-                proc_id=proc_id,
                 pattern=self._RECOVERY_PASSWORD_UTF16LE_RE.pattern,
                 compiled_pattern=self._RECOVERY_PASSWORD_UTF16LE_RE,
                 read_size=self._RECOVERY_PASSWORD_UTF16LE_LENGTH,
@@ -342,8 +429,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 cipher="",
                 key=vmk.hex(),
                 direct_use=vmk.hex(),
-                tool="dislocker -K (hex->bin)",
-                context="kernel pool FVEl",
             )
 
     def _scan_fveks_win10_x64(self) -> Iterator[Row]:
@@ -372,13 +457,11 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             f2 = self._read_member_bytes(fvek_pool, "fvek20", 64)
             f3 = self._read_member_bytes(fvek_pool, "fvek30", 64)
             location = self._format_offset(fvek_pool.vol.offset)
-            context = "kernel pool None"
 
             if f1[0:16] == f2[0:16]:
                 if f1[16:32] == f2[16:32]:
                     yield self._build_fvek_row(
                         location,
-                        context,
                         self.BLMode["40"],
                         f1[0:32],
                         b"",
@@ -388,7 +471,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 else:
                     yield self._build_fvek_row(
                         location,
-                        context,
                         self.BLMode["30"],
                         f1[0:16],
                         b"",
@@ -400,7 +482,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 if f1[16:32] == f3[16:32]:
                     yield self._build_fvek_row(
                         location,
-                        context,
                         self.BLMode["20"],
                         f1[0:32],
                         b"",
@@ -410,7 +491,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 else:
                     yield self._build_fvek_row(
                         location,
-                        context,
                         self.BLMode["10"],
                         f1[0:16],
                         b"",
@@ -445,7 +525,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             f1 = bytes(fvek_pool.fvek10)
             f2 = bytes(fvek_pool.fvek20)
             location = self._format_offset(fvek_pool.vol.offset)
-            context = "kernel pool Cngb"
 
             if f1[0:16] != f2[0:16]:
                 continue
@@ -453,7 +532,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             if f1[16:32] == f2[16:32]:
                 yield self._build_fvek_row(
                     location,
-                    context,
                     self.BLMode["20"],
                     f1[0:32],
                     b"",
@@ -463,7 +541,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             else:
                 yield self._build_fvek_row(
                     location,
-                    context,
                     self.BLMode["10"],
                     f1[0:16],
                     b"",
@@ -544,7 +621,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 tweak = f2[0:length] if mode in ("00", "01") else b""
                 yield self._build_fvek_row(
                     location=self._format_offset(fvek_pool.vol.offset),
-                    context="kernel pool FVEc",
                     cipher=self.BLMode[mode],
                     fvek=f1[0:length],
                     tweak=tweak,
@@ -574,14 +650,26 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             )
 
     def _generator(self) -> Iterator[Tuple[int, Row]]:
+        export_path = self._get_export_path()
+        scan_recovery_passwords = self.config.get("scan-recovery-passwords", False)
         seen: Set[Tuple[str, str]] = set()
+        fvek_rows: List[Row] = []
 
         for row in self._scan_fveks():
             key = (row[1], row[4])
             if key in seen:
                 continue
             seen.add(key)
+            fvek_rows.append(row)
             yield 0, row
+
+        if export_path:
+            for export_row in self._export_fveks(export_path, fvek_rows):
+                key = (export_row[1], export_row[4])
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield 0, export_row
 
         for row in self._scan_vmks():
             key = (row[1], row[4])
@@ -590,7 +678,7 @@ class Bitlocker(interfaces.plugins.PluginInterface):
             seen.add(key)
             yield 0, row
 
-        if self.config.get("scan-recovery-passwords", False):
+        if scan_recovery_passwords:
             for row in self._scan_recovery_passwords():
                 key = (row[1], row[4])
                 if key in seen:
@@ -606,8 +694,6 @@ class Bitlocker(interfaces.plugins.PluginInterface):
                 ("Cipher", str),
                 ("Key", str),
                 ("DirectUse", str),
-                ("Tool", str),
-                ("Context", str),
             ],
             self._generator(),
         )
